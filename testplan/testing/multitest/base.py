@@ -11,6 +11,7 @@ from schema import And, Or, Use
 
 from testplan.common import config, entity
 from testplan.common.utils import interface, strings, timing, watcher
+from testplan.common.utils.execution_time import execution_time_manager
 from testplan.common.utils.composer import compose_contexts
 from testplan.common.report import (
     ReportCategories,
@@ -1162,6 +1163,35 @@ class MultiTest(testing_base.Test):
         """Runs a testcase method and returns its report."""
 
         self.log_testcase_lifecycle(testcase, TestLifecycle.TESTCASE_START)
+
+        # Check if testplan execution time limit has been exceeded
+        if execution_time_manager.is_time_limit_exceeded():
+            testcase_report = testcase_report or self._new_testcase_report(
+                testcase
+            )
+            case_result: result.Result = self.cfg.result(
+                stdout_style=self.stdout_style,
+                _scratch=self.scratch,
+                _collect_code_context=self.collect_code_context,
+            )
+            
+            # Create a fake failed assertion explaining the time limit exceeded
+            time_limit = execution_time_manager.get_time_limit()
+            elapsed_time = execution_time_manager.get_elapsed_time()
+            case_result.fail(
+                message=f"Testplan execution time limit of {time_limit:.1f}s exceeded "
+                       f"(elapsed: {elapsed_time:.1f}s). Testcase marked as failed.",
+                description="Time limit exceeded"
+            )
+            
+            # Add the fake assertion to the report
+            testcase_report.extend(case_result.serialized_entries)
+            testcase_report.runtime_status = RuntimeStatus.FINISHED
+            if self.get_stdout_style(testcase_report.passed).display_testcase:
+                self.log_testcase_status(testcase_report)
+            
+            self.log_testcase_lifecycle(testcase, TestLifecycle.TESTCASE_END)
+            return testcase_report
 
         testcase_report = testcase_report or self._new_testcase_report(
             testcase

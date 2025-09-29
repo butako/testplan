@@ -151,6 +151,8 @@ class Testplan(entity.RunnableManager):
     :param debug: Enable or disable debug mode.
     :param timeout: Timeout value in seconds to kill Testplan and all child
         processes, default to 14400s(4h), set to 0 to disable.
+    :param execution_time_limit: Execution time limit in seconds. If set, testcases
+        will be marked as failed after this time limit is exceeded. Set to None to disable.
     :param interactive_handler: Handler for interactive mode execution.
     :param extra_deps: Extra module dependencies for interactive reload, or
         paths of these modules.
@@ -206,6 +208,7 @@ class Testplan(entity.RunnableManager):
         verbose: bool = False,
         debug: bool = False,
         timeout: int = defaults.TESTPLAN_TIMEOUT,
+        execution_time_limit: Optional[float] = defaults.TESTPLAN_EXECUTION_TIME_LIMIT,
         interactive_handler: Type["TestRunnerIHandler"] = None,
         extra_deps: Optional[List[Union[str, ModuleType]]] = None,
         label: Optional[str] = None,
@@ -274,6 +277,7 @@ class Testplan(entity.RunnableManager):
             verbose=verbose,
             debug=debug,
             timeout=timeout,
+            execution_time_limit=execution_time_limit,
             interactive_handler=interactive_handler,
             extra_deps=extra_deps,
             label=label,
@@ -422,6 +426,7 @@ class Testplan(entity.RunnableManager):
         verbose=False,
         debug=False,
         timeout=defaults.TESTPLAN_TIMEOUT,
+        execution_time_limit=defaults.TESTPLAN_EXECUTION_TIME_LIMIT,
         interactive_handler=None,
         extra_deps=None,
         label=None,
@@ -486,6 +491,7 @@ class Testplan(entity.RunnableManager):
                     verbose=verbose,
                     debug=debug,
                     timeout=timeout,
+                    execution_time_limit=execution_time_limit,
                     interactive_handler=interactive_handler,
                     extra_deps=extra_deps,
                     label=label,
