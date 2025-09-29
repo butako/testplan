@@ -41,6 +41,7 @@ from testplan.common.entity import (
     RunnableStatus,
 )
 from testplan.common.exporters import BaseExporter, ExportContext, run_exporter
+from testplan.common.utils.execution_time import execution_time_manager
 
 if TYPE_CHECKING:
     from testplan.common.remote.remote_service import RemoteService
@@ -270,6 +271,9 @@ class TestRunnerConfig(RunnableConfig):
             ConfigOption("debug", default=False): bool,
             ConfigOption("timeout", default=defaults.TESTPLAN_TIMEOUT): Or(
                 None, And(int, lambda t: t >= 0)
+            ),
+            ConfigOption("execution_time_limit", default=defaults.TESTPLAN_EXECUTION_TIME_LIMIT): Or(
+                None, And(Or(int, float), lambda t: t > 0)
             ),
             # active_loop_sleep impacts cpu usage in interactive mode
             ConfigOption("active_loop_sleep", default=0.05): float,
@@ -1359,9 +1363,19 @@ class TestRunner(Runnable):
             self.resource_monitor_server.stop()
             self.resource_monitor_server = None
 
+    def _start_execution_time_tracking(self):
+        """Initialize execution time limit tracking."""
+        execution_time_manager.reset()
+        execution_time_manager.start_tracking(self.cfg.execution_time_limit)
+        if self.cfg.execution_time_limit:
+            self.logger.user_info(
+                f"Execution time limit set to {self.cfg.execution_time_limit:.1f} seconds"
+            )
+
     def add_pre_resource_steps(self):
         """Runnable steps to be executed before resources started."""
         self._add_step(self.timer.start, "run")
+        self._add_step(self._start_execution_time_tracking)
         super(TestRunner, self).add_pre_resource_steps()
         self._add_step(self._start_remote_services)
         self._add_step(self.make_runpath_dirs)
