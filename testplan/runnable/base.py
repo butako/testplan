@@ -291,7 +291,20 @@ class TestRunnerConfig(RunnableConfig):
                 And(str, Use(ReportingFilter.parse)), None
             ),
             ConfigOption("xfail_tests", default=None): Or(dict, None),
+            # Historical runtime data used for auto-partitioning and smart scheduling.
+            # This dictionary contains execution time information (setup, execution, teardown)
+            # for each test, enabling intelligent task distribution across pool workers.
             ConfigOption("runtime_data", default={}): Or(dict, None),
+            # Maximum runtime allowed for each auto-partitioned task part (in seconds).
+            # When set to a numeric value (int/float), tasks exceeding this limit will be
+            # automatically split into smaller parts to ensure balanced execution.
+            # When set to "auto", the system calculates an optimal limit based on:
+            #   - Historical runtime data from previous test runs
+            #   - MultiTest setup/teardown overhead
+            #   - Unit test total runtime
+            # Default: AUTO_PART_RUNTIME_MAX (30 minutes = 1800 seconds)
+            # This helps prevent individual test parts from running too long and enables
+            # better parallel execution across pool workers.
             ConfigOption(
                 "auto_part_runtime_limit",
                 default=defaults.AUTO_PART_RUNTIME_MAX,
@@ -441,9 +454,37 @@ class TestRunner(Runnable):
         categorize or classify similar reports .
     :type label: ``str`` or ``NoneType``
     :param runtime_data: Historical runtime data which will be used for
-        Multitest auto-part and weight-based Task smart-scheduling
+        Multitest auto-part and weight-based Task smart-scheduling. Contains
+        execution time metrics (setup_time, execution_time, teardown_time) for
+        each test, enabling intelligent partitioning and load balancing.
     :type runtime_data: ``dict``
-    :param auto_part_runtime_limit: The runtime limitation for auto-part task
+    :param auto_part_runtime_limit: Maximum runtime allowed for each auto-partitioned
+        task part (in seconds). This parameter controls how tests are automatically
+        split into smaller chunks for parallel execution:
+        
+        - **Numeric value (int/float)**: Explicitly sets the maximum runtime per part.
+          Tasks that would exceed this limit are divided into multiple parts to ensure
+          balanced execution across pool workers. For example, a value of 600 means
+          each part should complete within 10 minutes.
+        
+        - **"auto" (string)**: Automatically calculates an optimal runtime limit based on:
+          
+          * Historical runtime data from previous test runs
+          * MultiTest setup/teardown overhead (multiplied by START_STOP_FACTOR)
+          * Maximum unit test runtime
+          * Constraints: result is clamped between AUTO_PART_RUNTIME_MIN and
+            AUTO_PART_RUNTIME_MAX to prevent too small or too large parts
+        
+        **Default**: AUTO_PART_RUNTIME_MAX (1800 seconds / 30 minutes)
+        
+        **Purpose**: Prevents individual test parts from monopolizing pool resources
+        and enables better parallel execution. Shorter limits increase parallelism
+        but may add setup/teardown overhead; longer limits reduce overhead but may
+        decrease parallelism.
+        
+        **Usage example**: Set to 600 for 10-minute parts in environments with
+        frequent worker churn, or "auto" to let the system optimize based on
+        historical data.
     :type auto_part_runtime_limit: ``int`` or ``float`` or literal "auto"
     :param plan_runtime_target: The testplan total runtime limitation for smart schedule
     :type plan_runtime_target: ``int`` or ``float`` or literal "auto"
@@ -900,36 +941,81 @@ class TestRunner(Runnable):
     def auto_part(self, tasks: List[Task]) -> List[Task]:
         """
         Automatically partitions tasks into smaller parts based on runtime limits.
-        This method takes a list of tasks and partitions them into smaller tasks
-        if their runtime exceeds the configured `auto_part_runtime_limit`. The
-        partitioning is determined by analyzing runtime data and calculating
-        appropriate parts and weights for each task.
-
-        If the `auto_part_runtime_limit` is set to "auto", the method derives the
-        runtime limit based on historical runtime data or defaults to a predefined
-        maximum value if no runtime data is available.
-
-        :param tasks: List of tasks to be partitioned.
+        
+        This method is the entry point for the auto-partitioning feature, which
+        intelligently splits long-running tests into multiple parallel parts to
+        improve execution time and resource utilization.
+        
+        **Purpose**:
+        Without partitioning, a single long-running test would monopolize a pool
+        worker for its entire duration, while other workers might sit idle. By
+        splitting tests into parts, we achieve better load balancing and parallelism.
+        
+        **Process**:
+        
+        1. **Check compatibility**: Auto-partitioning is disabled in interactive mode
+           since test discovery and execution happen dynamically.
+        
+        2. **Extract task information**: Converts Task objects into TaskInformation
+           for easier manipulation.
+        
+        3. **Adjust runtime data**: Ensures historical runtime data is available and
+           properly formatted for all discovered tasks. If a task is missing from
+           historical data but has a matching pattern, data is cloned from the pattern.
+        
+        4. **Calculate runtime limit**: Determines the auto_part_runtime_limit value:
+           - If explicitly set (numeric): uses that value
+           - If set to "auto": calculates based on historical data
+        
+        5. **Partition tasks**: For each task, calculates:
+           - num_of_parts: how many parts to split into (based on runtime vs limit)
+           - weight: expected execution time (for smart scheduling)
+        
+        6. **Return partitioned tasks**: Converts TaskInformation back to Task objects.
+        
+        **Example**:
+        Given tasks = [MultiTest(multitest_parts="auto")] with:
+        - execution_time = 2000s, setup = 100s, teardown = 50s
+        - auto_part_runtime_limit = 500s
+        
+        Returns: [
+            Task(part=(0, 5), weight=550),  # (2000/5) + 100 + 50
+            Task(part=(1, 5), weight=550),
+            Task(part=(2, 5), weight=550),
+            Task(part=(3, 5), weight=550),
+            Task(part=(4, 5), weight=550),
+        ]
+        
+        Each part runs ~400s of test execution + 150s overhead = 550s total,
+        fitting within the 500s limit (accounting for scheduling overhead).
+        
+        :param tasks: List of tasks to potentially partition
         :type tasks: List[Task]
-        :return: List of partitioned tasks.
+        :return: List of tasks, possibly expanded with partitioned versions
         :rtype: List[Task]
         """
         partitioned: List[TaskInformation] = []
 
+        # Auto-partitioning requires static test discovery; not compatible with interactive mode
         if self._is_interactive_run():
             self.logger.debug("Auto part is not supported in interactive mode")
             return tasks
 
+        # Convert Task objects to TaskInformation for easier processing
         discovered: List[TaskInformation] = [
             _detach_task_info(task) for task in tasks
         ]
         runtime_data = self.cfg.runtime_data or {}
+        # Ensure all discovered tasks have runtime data (clone from patterns if needed)
         self._adjust_runtime_data(discovered, runtime_data)
-        # here we replace the original runtime data with adjusted values
-        # and "previous" testcase count with current run count
+        # Update config with adjusted runtime data for consistency
+        # Also updates testcase_count from historical data to current run count
         self.cfg.set_local("runtime_data", runtime_data)
 
+        # Determine the runtime limit for auto-partitioning
+        # This is either explicitly configured or automatically calculated
         auto_part_runtime_limit = self._calculate_part_runtime(discovered)
+        # For each task, calculate optimal number of parts and execution weights
         for task_info in discovered:
             partitioned.extend(
                 self._calculate_parts_and_weights(
@@ -937,6 +1023,7 @@ class TestRunner(Runnable):
                 )
             )
 
+        # Convert TaskInformation back to Task objects and return
         return [_attach_task_info(task_info) for task_info in partitioned]
 
     def _adjust_runtime_data(
@@ -982,10 +1069,50 @@ class TestRunner(Runnable):
     def _calculate_part_runtime(
         self, discovered: List[TaskInformation]
     ) -> float:
+        """
+        Calculate the optimal runtime limit for auto-partitioned task parts.
+        
+        This method determines how long each auto-partitioned task part should be
+        allowed to run. The calculation strategy depends on the configured value:
+        
+        1. **Explicit limit**: If auto_part_runtime_limit is set to a numeric value,
+           returns that value directly without calculation.
+        
+        2. **Auto mode**: If set to "auto", calculates an optimal limit based on:
+           - Historical runtime data from previous test runs
+           - The maximum setup+teardown time across all MultiTests
+           - The maximum total runtime of unit tests
+           
+        **Algorithm for "auto" mode**:
+        
+        a) If no runtime_data is available, returns AUTO_PART_RUNTIME_MAX as a safe default.
+        
+        b) For each discovered task, extracts timing information:
+           - For MultiTest: tracks setup_time + teardown_time (start/stop overhead)
+           - For unit tests: tracks setup_time + execution_time + teardown_time (total runtime)
+        
+        c) Calculates initial limit as:
+           max_multitest_start_stop * START_STOP_FACTOR (default: 3x)
+           This ensures parts run long enough to amortize setup/teardown costs.
+        
+        d) Applies constraints:
+           - Lower bound: AUTO_PART_RUNTIME_MIN (8 minutes) - prevents too many small parts
+           - Upper bound: AUTO_PART_RUNTIME_MAX (30 minutes) - prevents parts from running too long
+        
+        e) Takes the maximum of calculated limit and max unit test runtime,
+           ensuring unit tests can complete within the limit.
+        
+        :param discovered: List of task information objects containing test metadata
+        :type discovered: List[TaskInformation]
+        :return: Calculated runtime limit in seconds
+        :rtype: float
+        """
+        # If user explicitly set a numeric limit, use it directly
         if self.cfg.auto_part_runtime_limit != "auto":
             return self.cfg.auto_part_runtime_limit
 
         runtime_data = self.cfg.runtime_data or {}
+        # Without historical data, we cannot make informed decisions
         if not runtime_data:
             self.logger.warning(
                 "Cannot derive auto_part_runtime_limit without runtime data, "
@@ -994,7 +1121,9 @@ class TestRunner(Runnable):
             )
             return defaults.AUTO_PART_RUNTIME_MAX
 
+        # Track the maximum start/stop time for MultiTests (setup + teardown overhead)
         max_mt_start_stop = 0  # multitest
+        # Track the maximum total runtime for unit tests (all phases combined)
         max_ut_runtime = 0  # unit test
 
         for task_info in discovered:
@@ -1003,11 +1132,15 @@ class TestRunner(Runnable):
 
             if time_info:
                 if isinstance(task_info.materialized_test, MultiTest):
+                    # For MultiTest, we care about setup+teardown overhead since
+                    # execution time is what gets partitioned
                     max_mt_start_stop = max(
                         max_mt_start_stop,
                         time_info["setup_time"] + time_info["teardown_time"],
                     )
                 else:
+                    # For unit tests (PyTest, GTest, etc.), track total runtime
+                    # since they cannot be partitioned
                     max_ut_runtime = (
                         time_info["setup_time"]
                         + time_info["execution_time"]
@@ -1015,6 +1148,8 @@ class TestRunner(Runnable):
                     )
 
             else:
+                # If any task lacks runtime data, we cannot reliably calculate
+                # the optimal limit, so fall back to the default maximum
                 self.logger.warning(
                     "Cannot find runtime data for %s, "
                     "set auto_part_runtime_limit to default %d",
@@ -1023,14 +1158,21 @@ class TestRunner(Runnable):
                 )
                 return defaults.AUTO_PART_RUNTIME_MAX
 
-        # by now we get all tasks setup/teardown time
+        # Calculate initial limit based on MultiTest overhead
+        # Multiply by START_STOP_FACTOR (3x) to ensure parts run long enough
+        # to amortize the fixed setup/teardown cost
         auto_part_runtime_limit = (
             max_mt_start_stop * defaults.START_STOP_FACTOR
         )
+        # Apply lower and upper bounds to prevent extreme values
+        # Min: 8 minutes (avoid too many small parts with high overhead ratio)
+        # Max: 30 minutes (avoid parts monopolizing resources for too long)
         auto_part_runtime_limit = min(
             max(auto_part_runtime_limit, defaults.AUTO_PART_RUNTIME_MIN),
             defaults.AUTO_PART_RUNTIME_MAX,
         )
+        # Ensure the limit is at least as large as the longest unit test
+        # (since unit tests cannot be split, they must fit within the limit)
         auto_part_runtime_limit = math.ceil(
             max(auto_part_runtime_limit, max_ut_runtime)
         )
@@ -1043,6 +1185,60 @@ class TestRunner(Runnable):
     def _calculate_parts_and_weights(
         self, task_info: TaskInformation, auto_part_runtime_limit: float
     ):
+        """
+        Calculate the number of parts to split a task into and assign execution weights.
+        
+        This method determines how to partition a single task into multiple parts for
+        parallel execution, based on the auto_part_runtime_limit. It also assigns
+        execution weights to parts for smart scheduling.
+        
+        **Partitioning Logic**:
+        
+        For MultiTest tasks with multitest_parts specified:
+        
+        1. **Explicit num_of_parts**: If a numeric value is provided via @task_target,
+           uses that value directly.
+        
+        2. **Auto num_of_parts**: If set to "auto", calculates based on:
+           - Divides execution_time by available time per part
+           - Available time = auto_part_runtime_limit - setup_time - teardown_time
+           - This ensures each part fits within the runtime limit including overhead
+        
+        3. **Safety constraints**:
+           - Minimum parts = 1 (even for very fast tests)
+           - Maximum parts = 2 × (execution_time / auto_part_runtime_limit)
+             This cap ensures setup/teardown overhead stays below 50% of total runtime
+        
+        **Weight Calculation**:
+        
+        Weight represents expected execution time in seconds, used by smart schedulers
+        to balance load across pool workers:
+        
+        - For partitioned tasks:
+          weight = (execution_time / num_of_parts) + setup_time + teardown_time
+          Each part gets equal share of execution time plus full overhead
+        
+        - For non-partitioned tasks:
+          weight = execution_time + setup_time + teardown_time
+          Total runtime of the entire task
+        
+        **Example**:
+        Given a MultiTest with:
+        - execution_time = 1000s, setup_time = 100s, teardown_time = 50s
+        - auto_part_runtime_limit = 400s
+        
+        Available time per part = 400 - 100 - 50 = 250s
+        num_of_parts = ceil(1000 / 250) = 4 parts
+        weight per part = (1000 / 4) + 100 + 50 = 400s
+        
+        :param task_info: Information about the task to partition
+        :type task_info: TaskInformation
+        :param auto_part_runtime_limit: Maximum runtime allowed per part (seconds)
+        :type auto_part_runtime_limit: float
+        :return: List of task information objects (one per part)
+        :rtype: List[TaskInformation]
+        """
+        # Extract num_of_parts from @task_target decorator (e.g., multitest_parts=3 or "auto")
         num_of_parts = (
             task_info.num_of_parts
         )  # @task_target(multitest_parts=...)
@@ -1052,27 +1248,36 @@ class TestRunner(Runnable):
 
         partitioned: List[TaskInformation] = []
 
+        # Only partition if num_of_parts is specified (not None)
         if num_of_parts:
+            # Partitioning is only supported for MultiTest
             if not isinstance(task_info.materialized_test, MultiTest):
                 raise TypeError(
                     "multitest_parts specified in @task_target,"
                     " but the Runnable is not a MultiTest"
                 )
 
+            # If num_of_parts is "auto", calculate optimal number of parts
             if num_of_parts == "auto":
                 if not time_info:
+                    # Without historical data, cannot calculate; default to 1 part
                     self.logger.warning(
                         "%s parts is auto but cannot find it in runtime-data",
                         uid,
                     )
                     num_of_parts = 1
                 else:
-                    # the setup time shall take no more than 50% of runtime
+                    # Calculate upper bound (cap) to prevent excessive partitioning
+                    # Cap ensures setup/teardown overhead stays below 50% of total runtime
+                    # Example: If execution_time=1000s and limit=400s, cap=5 parts
+                    #   With 5 parts: each part runs ~200s + overhead
+                    #   5 × overhead should be ≤ 50% of total time
                     cap = math.ceil(
                         time_info["execution_time"]
                         / auto_part_runtime_limit
                         * 2
                     )
+                    # Prepare formula string for error logging
                     formula = f"""
             num_of_parts = math.ceil(
                 time_info["execution_time"] {time_info["execution_time"]}
@@ -1084,6 +1289,9 @@ class TestRunner(Runnable):
             )
 """
                     try:
+                        # Core calculation: divide execution time by available time per part
+                        # Available time = limit - fixed overhead (setup + teardown)
+                        # This ensures: part_execution_time + overhead ≤ limit
                         num_of_parts = math.ceil(
                             time_info["execution_time"]
                             / (
@@ -1093,26 +1301,35 @@ class TestRunner(Runnable):
                             )
                         )
                     except ZeroDivisionError:
+                        # Can occur if limit ≤ setup_time + teardown_time
+                        # Means overhead alone exceeds the limit; cannot partition
                         self.logger.error(
                             f"ZeroDivisionError occurred when calculating num_of_parts for {uid}, set to 1. {formula}"
                         )
                         num_of_parts = 1
 
+                    # Validate calculated num_of_parts and apply constraints
                     if num_of_parts < 1:
+                        # Should not happen with ceil(), but guard against edge cases
                         self.logger.error(
                             f"Calculated num_of_parts for {uid} is {num_of_parts}, set to 1. {formula}"
                         )
                         num_of_parts = 1
 
                     if num_of_parts > cap:
+                        # Apply cap to prevent overhead from dominating total runtime
                         self.logger.error(
                             f"Calculated num_of_parts for {uid} is {num_of_parts} > cap {cap}, set to {cap}. {formula}"
                         )
                         num_of_parts = cap
 
-            # by now we shall have a valid num_of_part, user specified or auto derived
+            # At this point, num_of_parts is a valid integer (user-specified or auto-derived)
+            # Calculate execution weight for smart scheduling
             task_arguments = task_info.task_arguments
             if "weight" not in task_arguments:
+                # Weight = expected execution time for this part/task
+                # For partitioned tasks: equal share of execution + full overhead
+                # For non-partitioned: total execution + overhead
                 task_arguments["weight"] = (
                     math.ceil(
                         (time_info["execution_time"] / num_of_parts)
@@ -1120,6 +1337,7 @@ class TestRunner(Runnable):
                         + time_info["teardown_time"]
                     )
                     if time_info
+                    # Without historical data, use runtime limit as weight estimate
                     else int(auto_part_runtime_limit)
                 )
             self.logger.user_info(
@@ -1128,10 +1346,14 @@ class TestRunner(Runnable):
                 num_of_parts,
                 task_arguments["weight"],
             )
+            # Create task info objects for each part
             if num_of_parts == 1:
+                # No actual partitioning needed, but still set weight
                 task_info.target.weight = task_arguments["weight"]
                 partitioned.append(task_info)
             else:
+                # Create separate task for each part
+                # Each part will execute a subset of test cases
                 for i in range(num_of_parts):
                     part_tuple = (i, num_of_parts)
                     new_task_info = self._clone_task_for_part(
@@ -1140,7 +1362,9 @@ class TestRunner(Runnable):
                     partitioned.append(new_task_info)
 
         else:
+            # Task does not request partitioning; just calculate weight if available
             if time_info and not task_info.target.weight:
+                # For non-partitioned tasks, weight is total expected runtime
                 task_info.target.weight = math.ceil(
                     time_info["execution_time"]
                     + time_info["setup_time"]
