@@ -54,17 +54,40 @@ The squashed commit has been verified to contain exactly the same code changes a
 git diff 51bf9f9e 01b9ff54  # Returns empty diff
 ```
 
-## Note on Force Push
+## Applying the Squashed History
 
-⚠️ **Important**: To apply this squashed history to the remote branch, a force push is required:
+⚠️ **Important**: Due to automated tooling limitations, the squashed commit could not be force-pushed automatically. To complete the squashing process, you have two options:
+
+### Option 1: Use the provided script
+Run the `squash_pr3.sh` script which automates the entire process:
 ```bash
+./squash_pr3.sh
+```
+
+### Option 2: Manual steps
+Execute the following commands manually:
+```bash
+# Reset to base commit before PR#3
+git reset --hard 5a4e61b6
+
+# Squash merge all PR#3 commits
+git merge --squash 58581038
+
+# Create the squashed commit
+git commit -m "Add --testcase-timeout CLI option
+
+Add functionality to set a default timeout for all testcases via the
+--testcase-timeout CLI option...
+"
+
+# Force push to apply the rewritten history
 git push --force-with-lease origin copilot/squash-commits-pr3
 ```
 
-This rewrites the branch history from:
+This will rewrite the branch history from:
 - `5a4e61b6` → `merge commit 51bf9f9e` (containing 8 commits) → `d8e4bd1c`
 
 To:
-- `5a4e61b6` → `squashed commit 01b9ff54`
+- `5a4e61b6` → `squashed commit`
 
 The history rewrite is necessary because the merge commit and its parent commits are being replaced with a single squashed commit.
